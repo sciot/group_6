@@ -1,0 +1,1635 @@
+#+title: Smart Cities and Internet of Things
+#+subtitle: Documentation : A Smart Environment Management System for University Lecture Rooms
+* Concept and Images
+  A few images of the model:
+
+  [[./img/smartbox_concept.jpg]]
+
+  [[./img/smartbox1.jpg]]
+
+  [[./smartbox2.jpg]]
+
+  [[./img/architecture.png]]
+
+  [[./img/logical_overview.png]]
+
+* Parts
+  We have the following list of devices:
+** Computers
+   - 3x Raspberry Pi 3B+
+** Sensors
+   - 1x GrovePi
+   - 1x Multisensor + 1x Z-Stick
+** Actuators
+   - 1x Plugwise Set (1x Circle+ + 1x Circle + 1x Plugwise Stick)
+* Planning
+** Network
+   We will connect the Pis to a Switch on using the 10.0.0.0/24
+   Network. All Pi's will be running containers (lxd) in which most of
+   the software components will be running (an exception are
+   GPIO-based sensors, it is possible to make this setup work, but a
+   bit cumbersome and containers are not the sole scope of this
+   project).
+
+   In order to make life easy, we'll let the containers run on the
+   10.0.0.0/24 network as well.
+
+   The following table show the addresses we'll be using for the
+   Network:
+   
+   | Hostname          | Type      | OS           | IP Address | running services        | devices attached     |
+   |-------------------+-----------+--------------+------------+-------------------------+----------------------|
+   | pi-ig             | Pi 3B+    | Raspian      |  10.0.0.10 | lxd                     |                      |
+   | pi-tw             | Pi 3B+    | Raspian      |  10.0.0.11 | lxd                     |                      |
+   | pi-ms             | Pi 3B+    | Raspian      |  10.0.0.12 | lxd                     | DHT11 Sensor         |
+   | cn-ms-mqtt-server | container | Ubuntu 18.04 |  10.0.0.13 | mqtt-server             |                      |
+   | cn-tw-zstick      | container | Ubuntu 18.04 |  10.0.0.14 | zwave-to-mqtt-bridge    | Z-Stick, Multisensor |
+   | cn-ig-plugwise    | container | Ubuntu 18.04 |  10.0.0.15 | plugwise-to-mqtt-bridge | Plugwise             |
+   | cn-tw-tick        | container | Ubuntu 18.04 |  10.0.0.16 | influxdb                |                      |
+   | cn-ms-ff          | container | Ubuntu 18.04 |  10.0.0.17 | fast-forward-solver     |                      |
+
+   [[./img/network_overview.png]]
+* Setup
+** Raspberry Pi Installation
+   We installed the default =raspian-light= image on the SD cards. In
+   order to have enough space left for an extra Partition to store the
+   containers, we changed the installer to only allocate 6GB instead
+   of the whole SD card.
+
+   This can be achieved by modifying the
+   =/rootfs/usr/lib/raspi-config/init_resize.sh= script: the definition
+   of the =TARGET_END= variable has to be set to =$(($ROOT_PART_SIZE +
+   12582912))= in =line 59= (12582912 = 6GB in blocksize).
+
+   Also we set up the ip addresses on the Pis by setting =ip=10.0.0.X=
+   in the =cmdline.txt= file.
+
+   Finally we created a file called =ssh= on the boot partition of the
+   Pis, in order to make sure the =openssh= service is up and running.
+
+   Then we plugged the SD cards into the Pis, powered them up and let
+   the installer finish.
+** Raspberry Pi Postinstallation Notes
+   
+   First we changed the Pis hostnames:
+   #+BEGIN_SRC text
+     sudo hostnamectl set-hostname pi-XX.sciot
+   #+END_SRC
+   
+   On all Pis we installed lxd:
+   
+   #+BEGIN_SRC text
+     sudo apt update
+     sudo apt upgrade -y
+     sudo apt install -y snapd
+     sudo snap install lxd
+   #+END_SRC
+
+   After installing =snapd= you might have to reboot.
+
+   Afterwards logout and log back in again. If for some reason the =pi=
+   user was not added to the =lxd= group, you can add him manually:
+
+   #+BEGIN_SRC text
+     sudo adduser pi lxd
+     newgrp lxd
+   #+END_SRC
+
+   In order to have every machine on the network talk to each other we
+   also added the following lines to =/etc/hosts= on the Pis:
+
+   #+BEGIN_SRC text
+     10.0.0.10   pi-ig.sciot
+     10.0.0.11   pi-tw.sciot
+     10.0.0.12   pi-ms.sciot
+     10.0.0.13   cn-ms-mqtt-server.sciot
+     10.0.0.14   cn-tw-zstick.sciot
+     10.0.0.15   cn-ig-plugwise.sciot
+     10.0.0.16   cn-tw-influxdb.sciot
+     10.0.0.17   cn-ig-telegraf.sciot
+     10.0.0.18   cn-tw-chronograf.sciot
+     10.0.0.19   cn-ig-kapacitor.sciot
+   #+END_SRC
+
+To have proper networking with lxd we need to fix several things.
+from [[https://raspberrypi.stackexchange.com/questions/37920/how-do-i-set-up-networking-wifi-static-ip-address][here]] the idea on how to get back to standard networking came.
+what we do is that we edit the =/etc/network/interfaces= file like this:
+(sort of copied from [[https://blog.ubuntu.com/2016/04/07/lxd-networking-lxdbr0-explained][here]])
+
+#+BEGIN_SRC text
+  # interfaces(5) file used by ifup(8) and ifdown(8)
+
+  # Please note that this file is written to be used with dhcpcd
+  # For static IP, consult /etc/dhcpcd.conf and 'man dhcpcd.conf'
+
+  # Include files from /etc/network/interfaces.d:
+  #source-directory /etc/network/interfaces.d
+
+  #auto eth0
+  #iface eth0 inet static
+  #       address 10.0.0.10
+  #       netmask 255.255.255.0
+  #       gateway 10.0.0.1
+
+  iface eth0 inet manual
+
+  auto br0
+  iface br0 inet static
+          address 10.0.0.10
+          netmask 255.255.255.0
+          gateway 10.0.0.1
+          bridge_ports eth0
+          dns-nameservers 10.0.0.1
+#+END_SRC
+
+At this point you have to install the =bridge-utils= package, otherwise
+the pi will have problems creating =br0=:
+
+#+BEGIN_SRC text
+  sudo apt install -y bridge-utils
+#+END_SRC
+
+after that we disable the DHCP client daemon and enabele standard Debian networking:
+#+BEGIN_SRC text
+  sudo systemctl disable dhcpcd
+  sudo systemctl enable networking
+#+END_SRC
+
+the ip entry in the =cmdline.txt= file on the boot partition also needs
+to be removed. this was just for easier finding the Pi during the
+initial setup.
+
+If necessary you can set up DNS to use whatever nameserver you want,
+this might not apply to your network setup. If you need to set up a
+static DNS server, you can put it into the =resolv.conf= file
+(e.g. using 10.0.0.1 as nameserver):
+
+#+BEGIN_SRC text
+  sudo rm /etc/resolv.conf
+  sudo echo 'nameserver 10.0.0.1' > /etc/resolv.conf
+#+END_SRC
+
+Finally a reboot is required
+#+BEGIN_SRC text
+  sudo reboot
+#+END_SRC
+
+after the reboot the output of =ifconfig= and =ip route= should look like this
+#+BEGIN_SRC text
+  pi@pi-ig:~ $ ifconfig
+  br0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+          inet 10.0.0.10  netmask 255.255.255.0  broadcast 10.0.0.255
+          inet6 fe80::ba27:ebff:feda:b7fd  prefixlen 64  scopeid 0x20<link>
+          ether b8:27:eb:da:b7:fd  txqueuelen 1000  (Ethernet)
+          RX packets 112  bytes 13084 (12.7 KiB)
+          RX errors 0  dropped 0  overruns 0  frame 0
+          TX packets 101  bytes 12917 (12.6 KiB)
+          TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+  eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+          ether b8:27:eb:da:b7:fd  txqueuelen 1000  (Ethernet)
+          RX packets 112  bytes 14652 (14.3 KiB)
+          RX errors 0  dropped 0  overruns 0  frame 0
+          TX packets 101  bytes 12917 (12.6 KiB)
+          TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+  lo: flags=73<UP,LOOPBACK,RUNNING>  mtu 65536
+          inet 127.0.0.1  netmask 255.0.0.0
+          inet6 ::1  prefixlen 128  scopeid 0x10<host>
+          loop  txqueuelen 1000  (Local Loopback)
+          RX packets 2  bytes 78 (78.0 B)
+          RX errors 0  dropped 0  overruns 0  frame 0
+          TX packets 2  bytes 78 (78.0 B)
+          TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+  pi@pi-ig:~ $ ip route
+  default via 10.0.0.1 dev br0 onlink                                                                                           
+  10.0.0.0/24 dev br0 proto kernel scope link src 10.0.0.10                                                                     
+#+END_SRC
+
+Next we can set up lxd. In order to do that, we first to create a
+third partition for the containers, currently the layout on the pis
+looks as follows:
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ lsblk
+  NAME        MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+  loop0         7:0    0 48.2M  1 loop /snap/lxd/7610
+  loop1         7:1    0 73.4M  0 loop /snap/core/4916
+  mmcblk0     179:0    0 29.7G  0 disk 
+  ├─mmcblk0p1 179:1    0 43.2M  0 part /boot
+  └─mmcblk0p2 179:2    0    6G  0 part /
+#+END_SRC
+
+We add a new partition using =cfdisk=:
+
+#+BEGIN_SRC text
+  sudo cfdisk /dev/mmcblk0
+#+END_SRC
+
+The result should look like this (or course different, depending on
+the size of the microSD card):
+
+#+BEGIN_SRC text
+  Disk /dev/mmcblk0: 29.7 GiB, 31914983424 bytes, 62333952 sectors
+  Units: sectors of 1 * 512 = 512 bytes
+  Sector size (logical/physical): 512 bytes / 512 bytes
+  I/O size (minimum/optimal): 512 bytes / 512 bytes
+  Disklabel type: dos
+  Disk identifier: 0xa9682bdc
+
+  Device         Boot    Start      End  Sectors  Size Id Type
+  /dev/mmcblk0p1          8192    96663    88472 43.2M  c W95 FAT32 (LBA)
+  /dev/mmcblk0p2         98304 12582912 12484609    6G 83 Linux
+  /dev/mmcblk0p3      12584960 62333951 49748992 23.7G 83 Linux
+#+END_SRC
+
+In this case, we just created a 24GB partition for the containers
+(=/dev/mmcblk0p3=).
+
+
+Then we set up lxd in order to use =br0= as networking device and
+=/dev/mmcblk0p3= as storage. We used mostly the default values, except
+for networking, storage and the question to make the API available
+over the network (there we chose the super secret trust password
+sciot):
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ lxd init
+  Would you like to use LXD clustering? (yes/no) [default=no]: 
+  Do you want to configure a new storage pool? (yes/no) [default=yes]: 
+  Name of the new storage pool [default=default]: 
+  Name of the storage backend to use (btrfs, ceph, dir, lvm) [default=btrfs]: 
+  Create a new BTRFS pool? (yes/no) [default=yes]: 
+  Would you like to use an existing block device? (yes/no) [default=no]: yes
+  Path to the existing block device: /dev/mmcblk0p3
+  Would you like to connect to a MAAS server? (yes/no) [default=no]: 
+  Would you like to create a new local network bridge? (yes/no) [default=yes]: no
+  Would you like to configure LXD to use an existing bridge or host interface? (yes/no) [default=no]: yes
+  Name of the existing bridge or host interface: br0
+  Would you like LXD to be available over the network? (yes/no) [default=no]: yes
+  Address to bind LXD to (not including port) [default=all]: 
+  Port to bind LXD to [default=8443]: 
+  Trust password for new clients: 
+  Again: 
+  Would you like stale cached images to be updated automatically? (yes/no) [default=yes] 
+  Would you like a YAML "lxd init" preseed to be printed? (yes/no) [default=no]:
+#+END_SRC
+
+In case you want to quickly replicate the setup, you can just set up
+=br0= as well as the third partition and use the following YAML to set
+up an identical lxd host:
+
+#+BEGIN_SRC text
+  config:
+    core.https_address: '[::]:8443'
+    core.trust_password: sciot
+  networks: []
+  storage_pools:
+  - config:
+      source: /dev/mmcblk0p3
+    description: ""
+    name: default
+    driver: btrfs
+  profiles:
+  - config: {}
+    description: ""
+    devices:
+      eth0:
+	name: eth0
+	nictype: bridged
+	parent: br0
+	type: nic
+      root:
+	path: /
+	pool: default
+	type: disk
+    name: default
+  cluster: null
+#+END_SRC
+
+Now you should be able to list available lxd images, e.g. all
+=alpinelinux= images for the arm architecture:
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ lxc image list -c lpdas images: alpine arm
+  +----------------------------+--------+------------------------------------+---------+--------+
+  |           ALIAS            | PUBLIC |            DESCRIPTION             |  ARCH   |  SIZE  |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.4 (3 more)        | yes    | Alpine 3.4 armhf (20180627_17:50)  | armv7l  | 1.63MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.5 (3 more)        | yes    | Alpine 3.5 armhf (20180703_13:28)  | armv7l  | 2.99MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.5/arm64 (1 more)  | yes    | Alpine 3.5 arm64 (20180703_13:09)  | aarch64 | 2.96MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.6 (3 more)        | yes    | Alpine 3.6 armhf (20180703_13:03)  | armv7l  | 3.11MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.6/arm64 (1 more)  | yes    | Alpine 3.6 arm64 (20180703_13:01)  | aarch64 | 3.07MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.7 (3 more)        | yes    | Alpine 3.7 armhf (20180703_13:02)  | armv7l  | 3.27MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.7/arm64 (1 more)  | yes    | Alpine 3.7 arm64 (20180703_13:00)  | aarch64 | 3.24MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.8 (3 more)        | yes    | Alpine 3.8 armhf (20180703_13:03)  | armv7l  | 2.26MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/3.8/arm64 (1 more)  | yes    | Alpine 3.8 arm64 (20180703_13:03)  | aarch64 | 2.23MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/edge (3 more)       | yes    | Alpine edge armhf (20180703_13:10) | armv7l  | 3.48MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+  | alpine/edge/arm64 (1 more) | yes    | Alpine edge arm64 (20180703_13:00) | aarch64 | 3.45MB |
+  +----------------------------+--------+------------------------------------+---------+--------+
+#+END_SRC
+
+Starting a container should create a container on the 10.0.0.0/24 network:
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ lxc launch images:alpine/edge
+  Creating the container
+  Container name is: close-whippet              
+  Starting close-whippet
+  pi@pi-tw:~ $ lxc list
+  +---------------+---------+-------------------+------+------------+-----------+
+  |     NAME      |  STATE  |       IPV4        | IPV6 |    TYPE    | SNAPSHOTS |
+  +---------------+---------+-------------------+------+------------+-----------+
+  | close-whippet | RUNNING | 10.0.0.213 (eth0) |      | PERSISTENT | 0         |
+  +---------------+---------+-------------------+------+------------+-----------+
+#+END_SRC
+
+=lxd= has - like git - the concept of =remotes=, you can list them with:
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ lxc remote list
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+  |      NAME       |                   URL                    |   PROTOCOL    | AUTH TYPE | PUBLIC | STATIC |
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+  | images          | https://images.linuxcontainers.org       | simplestreams |           | YES    | NO     |
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+  | local (default) | unix://                                  | lxd           | tls       | NO     | YES    |
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+  | ubuntu          | https://cloud-images.ubuntu.com/releases | simplestreams |           | YES    | YES    |
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+  | ubuntu-daily    | https://cloud-images.ubuntu.com/daily    | simplestreams |           | YES    | YES    |
+  +-----------------+------------------------------------------+---------------+-----------+--------+--------+
+#+END_SRC
+
+In order to make life easier, we add the pis as remotes, on every pi run:
+
+#+BEGIN_SRC text 
+  lxc remote add pi-ig 10.0.0.10
+  lxc remote add pi-tw 10.0.0.11
+  lxc remote add pi-ms 10.0.0.12
+#+END_SRC
+
+Check the certificates and enter the trust password.
+
+Now you can control any container on any of the three pis by
+prepending the remotename (e.g. pi-tw) to the containername
+(e.g. pi-tw:cn-plugwise).
+
+For example if you want to list all containers currently running, you
+can do:
+
+#+BEGIN_SRC text
+  pi@pi-tw:~ $ for r in ig tw ms; do echo "containers on pi-$r:";lxc list pi-$r:; done
+  containers on pi-ig:
+  +------+-------+------+------+------+-----------+
+  | NAME | STATE | IPV4 | IPV6 | TYPE | SNAPSHOTS |
+  +------+-------+------+------+------+-----------+
+  containers on pi-tw:
+  +------+-------+------+------+------+-----------+
+  | NAME | STATE | IPV4 | IPV6 | TYPE | SNAPSHOTS |
+  +------+-------+------+------+------+-----------+
+  containers on pi-ms:
+  +------+-------+------+------+------+-----------+
+  | NAME | STATE | IPV4 | IPV6 | TYPE | SNAPSHOTS |
+  +------+-------+------+------+------+-----------+
+#+END_SRC
+
+No containers are running yet, but nice, huh?
+** Useful helperscripts
+   
+   Some little helpers, you can use to make life easier, just source and enjoy:
+   #+BEGIN_SRC text
+     alias lxc_list_all='for r in ig tw ms; do echo "containers on pi-$r:";lxc list pi-$r:; done'
+   #+END_SRC
+   
+** Setting up Sensors, Actuators and Services
+*** MQTT
+    First we create a new container for the MQTT Server:
+
+    #+BEGIN_SRC text
+      lxc init images:ubuntu/18.04 pi-ms:cn-ms-mqtt-server -c security.privileged=true
+    #+END_SRC
+
+    Then we create a network configuration file in the container.
+
+    #+BEGIN_SRC text
+      lxc file push netcfg-mqtt-server.yaml pi-ms:cn-ms-mqtt-server/etc/netplan/10-lxc.yaml
+    #+END_SRC
+
+    The netcfg-mqtt-server.yaml looks like this:
+    #+BEGIN_SRC text
+      network:
+	version: 2
+	ethernets:
+	  eth0:
+	    dhcp4: no
+	    addresses: [10.0.0.13/24]
+	    gateway4: 10.0.0.1
+	    nameservers:
+	      addresses: [10.0.0.1]
+    #+END_SRC
+
+    Now we have created the mqtt container, we have to start it and
+    install the mqtt-server.
+
+    #+BEGIN_SRC text
+      lxc start pi-ms:cn-ms-mqtt-server
+      lxc exec pi-ms:cn-ms-mqtt-server -- apt update
+      lxc exec pi-ms:cn-ms-mqtt-server -- apt install -y mosquitto
+    #+END_SRC
+
+    Now the mosquitto service should be up and running:
+    #+BEGIN_SRC text
+      pi@pi-tw:~ $ lxc exec pi-ms:cn-ms-mqtt-server -- systemctl status mosquitto
+      ● mosquitto.service - LSB: mosquitto MQTT v3.1 message broker
+	 Loaded: loaded (/etc/init.d/mosquitto; generated)
+	 Active: active (running) since Wed 2018-07-04 16:03:05 UTC; 27s ago
+	   Docs: man:systemd-sysv-generator(8)
+	 CGroup: /system.slice/mosquitto.service
+		 └─393 /usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
+    #+END_SRC
+*** Z-stick and Multisensor6
+    Next we set up the Z-stick to get information from the Multisensor
+    and relay them to the MQTT Server.
+
+    First we pressed the buttons on the Z-Stick and the Multisensor6
+    and told them to connoct to with each other.
+
+    Since the Z-stick makes itself available as serial port via a
+    =/dev/ttyACM?=, in our case it is:
+
+    #+BEGIN_SRC text
+      pi@pi-tw:~ $ ls /dev/ttyACM*
+      /dev/ttyACM0
+    #+END_SRC
+
+    We can just mount this device into a container and set everything
+    up in there:
+    #+BEGIN_SRC text
+      lxc init images:ubuntu/18.04 pi-tw:cn-tw-zstick
+      lxc file push netcfg-zstick.yaml pi-tw:cn-tw-zstick/etc/netplan/10-lxc.yaml
+      lxc config device add pi-tw:cn-tw-zstick zstick unix-char source=/dev/ttyACM0 path=/dev/zstick uid=0 gid=20 mode=0660
+      lxc start pi-tw:cn-tw-zstick
+    #+END_SRC
+
+    The =netcfg-zstick.yaml= looks like this:
+    #+BEGIN_SRC text
+      network:
+	version: 2
+	ethernets:
+	  eth0:
+	    dhcp4: no
+	    addresses: [10.0.0.14/24]
+	    gateway4: 10.0.0.1
+	    nameservers:
+	      addresses: [10.0.0.1]
+    #+END_SRC
+
+    In order to make the Z-Stick work inside the container we have to
+    set up the =python-openzwave= project:
+
+    #+BEGIN_SRC text
+      lxc file push setup-zstick.sh pi-tw:cn-tw-zstick/root/
+      lxc exec pi-tw:cn-tw-zstick -- bash setup-zstick.sh
+    #+END_SRC   
+    
+    The =setup-zstick.sh= file looks like this, it sets up
+    =python-openzwave= and installs =zwave-mqtt-bridge=:
+    #+BEGIN_SRC text
+      #!/bin/bash
+
+      apt update                                                   
+      apt install -y libudev-dev python-pip git make libudev-dev g++ libyaml-dev cython cython3
+      git clone https://github.com/OpenZWave/python-openzwave
+      cd /root/python-openzwave
+      git checkout v0.3.3
+      git submodule update --init
+      make build
+      make install
+      pip install zwave-mqtt-bridge tzlocal
+    #+END_SRC
+
+    You can now test the Z-Stick and the MQTT server by sending the
+    Multisensors Data to a topic.
+
+    #+BEGIN_SRC text
+      pi@pi-tw:~ $ lxc exec pi-tw:cn-tw-zstick -- zwave_mqtt_bridge -d /dev/zstick --basetopic test 10.0.0.13
+      Waiting for network
+      Network ready
+      home_id: [0xddc694a1] id: [1] name: [] model: [ZW090 Z-Stick Gen5 EU]
+      home_id: [0xddc694a1] id: [2] name: [] model: [ZW100 MultiSensor 6]
+      Running: Ctrl+C to exit.
+      Wake-up Interval update: test/updates/2 240.000000
+      Group 1 Interval update: test/updates/2 60.000000
+      Temperature update: test/updates/2 26.500000
+      Relative Humidity update: test/updates/2 51.000000
+      Battery Level update: test/updates/2 100.000000
+      Luminance update: test/updates/2 376.000000
+      Ultraviolet update: test/updates/2 0.000000
+      Alarm Type update: test/updates/2 0.000000
+      Alarm Level update: test/updates/2 0.000000
+      SourceNodeId update: test/updates/2 0.000000
+      Burglar update: test/updates/2 3.000000
+    #+END_SRC
+
+    Since we use InfluxDB, which requires a specific data format and
+    the time interval of the Sensor is set to 60s, we changed out the
+    =zwave_mqtt_bridge= script with a custom one, better fit for our
+    case:
+
+    #+BEGIN_SRC text
+      lxc file push zwave_mqtt_bridge pi-tw:cn-tw-zstick/usr/local/bin/zwave_mqtt_bridge
+    #+END_SRC
+
+    Our custom version of the bridge looks like this and sends out
+    InfluxDB-compatible json messages:
+
+    #+BEGIN_SRC text
+      #!/usr/bin/python
+
+      """Publish ZWave Multisensor events to MQTT.
+
+      Connects to a Z-Wave controller using python-openzwave (use the --device
+      option to specify a path to the device).  For any multilevel sensor devices,
+      sets their reporting interval to 60s (assuming they have a "Group 1 Reporting
+      Interval" setting, which the Aeotec MultiSensor 6 does), and then publishes a
+      JSON message containing sensor data whenver it is received containing any of
+      temperature, relative humidity, luminnance, or UV level.
+
+      Tested so far with a simple Z-Wave network with two Aeotec MultiSensor 6
+      devices only.
+      """
+
+      import os.path
+      import time
+      import signal
+      import json
+      import argparse
+
+      import paho.mqtt.client as mqtt
+      from louie import dispatcher
+      from openzwave.option import ZWaveOption
+      from openzwave.network import ZWaveNetwork
+      from watchdog.observers import Observer
+      from watchdog.events import FileSystemEventHandler
+      from datetime import datetime
+      from tzlocal import get_localzone
+
+      EXIT = False
+
+      class DeviceWatcher(FileSystemEventHandler):
+	  def __init__(self, device, network):
+	      self.device = device
+	      self.network = network
+	      super(DeviceWatcher, self).__init__()
+
+	  def on_deleted(self, event):
+	      if event.src_path == self.device:
+		  self.network.stop()
+	      print "Deleted, %s" % str(event)
+
+	  def on_created(self, event):
+	      if event.src_path == self.device:
+		  self.network.start()
+	      print "Create, %s" % str(event)
+
+      def main():
+	  # Parse args:
+	  parser = argparse.ArgumentParser(
+	      description="MQTT interface to Z-Wave sensors.")
+	  parser.add_argument("mqtt_host", default="localhost", type=str,
+			      help="MQTT host")
+	  parser.add_argument("-U", default=None, type=str, dest="mqtt_user",
+			      help="MQTT username")
+	  parser.add_argument("-p", default=None, type=str, dest="mqtt_pass",
+			      help="MQTT password")
+	  parser.add_argument("-d", "--device", default="/dev/ttyACM0",
+			      help="Path to Z-Stick device")
+	  parser.add_argument('-u', default='.', dest="user_path",
+			      help="Path to write user files (e.g. current Z-Wave "
+				   "configursation")
+	  parser.add_argument("--basetopic", default="zwave", type=str,
+			      help="Base topic to publish/subscribe to")
+	  args = parser.parse_args()
+
+	  # Set up MQTT
+	  mqtt_client = mqtt.Client()
+	  if args.mqtt_user and args.mqtt_pass:
+	      mqtt_client.username_pw_set(args.mqtt_user, args.mqtt_pass)
+
+	  updates_basetopic = args.basetopic + "/updates/"
+	  set_basetopic = args.basetopic + "/set"
+	  refresh_basetopic = args.basetopic + "/refresh"
+
+	  # Control commands:
+	  def on_message(client, userdata, msg):
+	      print "- %s: %s" % (msg.topic, msg.payload)
+
+	      try:
+		  # Setting values:
+		  if msg.topic.startswith(set_basetopic):
+		      # Control message: get the node ID:
+		      node_id = int(msg.topic[len(set_basetopic):].lstrip('/'))
+		      data = json.loads(msg.payload)
+		      for value in network.nodes[node_id].get_values().values():
+			  if value.label in data:
+			      value.data = data[value.label]
+		  # Refresh values:
+		  elif msg.topic.startswith(refresh_basetopic):
+		      node_id = int(msg.topic[len(refresh_basetopic):].lstrip('/'))
+		      data = json.loads(msg.payload)
+		      for value in network.nodes[node_id].get_values().values():
+			  if value.label in data:
+			      value.refresh()
+	      except Exception as e:
+		  print "Error processing message: %s" % e
+
+	  def on_connect(client, userdata, flags, rc):
+	      try:
+		  if not rc:
+		      client.subscribe(set_basetopic + '/#')
+		      client.subscribe(refresh_basetopic + '/#')
+	      except Exception as e:
+		  print "Error connecting: %s" % str(e)
+
+	  mqtt_client.on_connect = on_connect
+	  mqtt_client.on_message = on_message
+	  mqtt_client.connect(args.mqtt_host, port=1883)
+
+	  # Start MQTT thread in background: although we don't subscribe to events
+	  # this is useful for automatically reconnecting to the service when it goes
+	  # down.
+	  mqtt_client.loop_start()
+
+	  # Initialise openzwave.
+	  zw_options = ZWaveOption(args.device, user_path=args.user_path)
+	  zw_options.set_console_output(False)
+	  zw_options.lock()
+	  network = ZWaveNetwork(zw_options)
+	  network.start()
+
+	  # Disconnect/reconnect when the device node goes away/re-appears.
+	  observer = Observer()
+	  observer.schedule(DeviceWatcher(args.device, network), os.path.dirname(args.device))
+	  observer.start()
+
+	  print "Waiting for network"
+	  while network.state != network.STATE_READY:
+	      time.sleep(1)
+
+	  print "Network ready"
+
+
+	  # Connect to events
+	  def value_updated(network, node, value):
+	      now = datetime.now(get_localzone())
+	      message_body = {
+		      "measurement": "multisensor6",
+		      "host": "cn-tw-zstick",
+		      "running_on": "pi-tw:cn-tw-zstick",
+		      "host_type": "container",
+		      "sensor": "multisensor6",
+		      "sensor_type": "multisensor",
+		      "measurement_type": value.label,
+		      "time": now.isoformat(),
+    		      value.label: value.data
+		  }
+	      print "%s update: %s %f" % (value.label, updates_basetopic + str(node.node_id), value.data)
+	      mqtt_client.publish(updates_basetopic + str(node.node_id),
+				  payload=json.dumps(message_body))
+
+        
+	  def sigint_handler(sig, frame):
+	      global EXIT
+	      EXIT = True
+	  signal.signal(signal.SIGINT, sigint_handler)
+	  dispatcher.connect(value_updated, ZWaveNetwork.SIGNAL_VALUE)
+
+	  # Configure nodes to puhblish data every 60s:
+	  for node in network.nodes.values():
+	      print node
+	      if not ("COMMAND_CLASS_SENSOR_MULTILEVEL" in
+		      node.command_classes_as_string):
+		  continue
+	      for value in node.get_values().values():
+		  if value.label == "Wake-up Interval":
+		      value.data = 10
+		  if value.label == "Group 1 Interval":
+		      # Only relevant on battery
+		      value.data = 10
+
+	  # Loop until we're told to exit:
+	  print "Running: Ctrl+C to exit."
+	  while not EXIT:
+	      signal.pause()
+	  dispatcher.disconnect(value_updated, ZWaveNetwork.SIGNAL_VALUE)
+	  observer.stop()
+
+	  mqtt_client.loop_stop()
+
+      if __name__ == "__main__":
+	  main()
+    #+END_SRC
+
+    Now we can send messages to the influxdb container using the MQTT
+    server. Due to the way the =telegraf= MQTT consumer works (it
+    accepts only one dataformat), we'll send the messages to the
+    'sciot/json' basetopic:
+
+    #+BEGIN_SRC text
+      pi@pi-tw:~ $ lxc exec pi-tw:cn-tw-zstick -- zwave_mqtt_bridge -d /dev/zstick --basetopic sciot/json 10.0.0.17
+      Waiting for network
+      Network ready
+      home_id: [0xddc694a1] id: [1] name: [] model: [ZW090 Z-Stick Gen5 EU]
+      home_id: [0xddc694a1] id: [2] name: [] model: [ZW100 MultiSensor 6]
+      Running: Ctrl+C to exit.
+      Wake-up Interval update: sciot/json/updates/2 240.000000
+    #+END_SRC
+*** DHT11
+    The =DHT11= sensor is the only sensor or actuator we didn't set up
+    inside a container. Though it is probably possible using the =gpio=
+    device, we didn't want to go down that rabbit hole for now.
+
+    The following steps were done on =pi-ms=:
+
+    #+BEGIN_SRC text
+      sudo apt install -y python-pip unrar-free
+      pip install paho-mqtt tzlocal
+      wget http://osoyoo.com/wp-content/uploads/2017/03/dht11_code.rar
+      unrar x dht11_code.rar
+    #+END_SRC
+
+    Then we can send metrics to the MQTT Server using a simple script (which is not part of the dht11_code):
+
+    #+BEGIN_SRC text
+      cd dht11_code
+      python dht11_mqtt_bridge
+    #+END_SRC
+
+    The script looks like this, it has to be copied to =~/dht11_code=:
+    #+BEGIN_SRC text
+      import time
+      import dht11
+      import RPi.GPIO as GPIO
+      import paho.mqtt.client as mqtt
+      from subprocess import call
+
+      #define GPIO 2 as DHT11 data pin
+      Temp_sensor=2
+
+      #define MQTT stuff
+      MQTT_ip    = "10.0.0.13"
+      MQTT_port  = 1883
+      MQTT_topic = "sciot/influx"
+
+      def main():
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)       # Use BCM GPIO numbers
+        # Initialise display
+        #  lcd_init()
+        instance = dht11.DHT11(pin = Temp_sensor)
+
+        # setting up MQTT
+        def on_connect(client, userdata, flags, rc):
+          print("Connected with result code " + str(rc))
+
+        mqtt_client = mqtt.Client()
+        mqtt_client.on_connect = on_connect
+
+        mqtt_client.connect(MQTT_ip, MQTT_port, 60)
+
+        mqtt_client.loop_start()
+
+        while True:
+          #get DHT11 sensor value
+          result = instance.read()
+          if (result.temperature == 0 and result.humidity == 0):
+            print "measurement error: temp " + `result.temperature` + ", hum " + `result.humidity`
+          else:
+            print "Temperature = ",`result.temperature`,"C"," Humidity = ",`result.humidity`,"%"
+
+            #mqtt_client.publish((MQTT_topic + "/Temperature"), result.temperature)
+            #mqtt_client.publish((MQTT_topic + "/Humidity"), result.humidity)
+
+            #publish for telegraf
+            now = subprocess.Popen(["date","+%s%N"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+            mqtt_client.publish(MQTT_topic, "mqtt_consumer" + "," + "host=pi-ms,host_type=bare_metal,measurement_type=Temperature,sensor=DHT11" + " " + "Temperature=" + `result.temperature` + " " + now)
+
+            mqtt_client.publish(MQTT_topic, "mqtt_consumer" + "," + "host=pi-ms,host_type=bare_metal,measurement_type=Relative\ Humidity,sensor=DHT11" + " " + "Relative\ Humidity=" + `result.humidity` + " " + now)
+
+
+          time.sleep(1)
+
+      if __name__ == '__main__':
+
+        try:
+          main()
+        except KeyboardInterrupt:
+          pass
+    #+END_SRC
+*** Plugwise
+Now we set up the Plugwise sockets to send power usage information to the MQTT server and to switch dem according to the information from the MQTT server.
+
+The Plugwise usb stick is a serial device which is usually found under =/dev/ttyUSB0=. As there might be other devices using this device already we check to make sure:
+
+#+BEGIN_SRC text
+  pi@pi-ig:~ $ ls /dev/ttyUSB*
+  /dev/ttyUSB0
+#+END_SRC
+
+This device can be mounted into a container in which everything related to it runs:
+#+BEGIN_SRC text
+  lxc init images:ubuntu/bionic pi-ig:cn-ig-plugwise
+  lxc file push netcfg-plugwise.yaml pi-ig:cn-ig-plugwise/etc/netplan/10-lxc.yaml
+  lxc config device add pi-ig:cn-ig-plugwise plugiwse unix-char source=/dev/ttyUSB0 path=/dev/ttyUSB0 uid=0 gid=20 mode=0660
+  lxc start pi-ig:cn-ig-plugwise
+#+END_SRC
+
+To make plugwise work with MQTT we use the python-plugwise project from github and a script we've written.
+For setting everything up we have a =setup-plugwise.sh= scripth which looks like this:
+#+BEGIN_SRC text
+  #!/bin/bash
+
+  apt update                                                   
+  apt install -y python-pip git
+  git clone https://github.com/aequitas/python-plugwise
+  cd /root/python-plugwise
+  sudo python setup.py install
+  pip install tzlocal paho-mqtt
+
+#+END_SRC
+
+The python script we wrote acts as bridge between MQTT and plugwise_util:
+#+BEGIN_SRC text
+  #!/usr/bin/python
+
+  import time
+  import os
+  import paho.mqtt.client as mqtt
+  import subprocess
+
+  #define MQTT stuff
+  MQTT_ip    = "10.0.0.13"
+  MQTT_port  = 1883
+  MQTT_topic_in = "sciot/actuators"
+  MQTT_topic_out = "sciot/influx"
+
+  circle_plus_mac    = "000D6F0005A9147D"
+  circle_plus_switch = "0"
+  circle_mac    = "000D6F0004B1E3FB"
+  circle_switch = "0"
+
+  def main():
+    # setting up MQTT
+    def on_connect(client, userdata, flags, rc):
+      print("Connected with result code " + str(rc))
+
+      client.subscribe(MQTT_topic_in + "/#")
+
+    def on_message(client, userdata, msg):
+      print(msg.topic + " " + str(msg.payload))
+      
+      if(msg.topic == (MQTT_topic_in + "/circle_plus_switch")):
+        global circle_plus_switch
+        circle_plus_switch = str(msg.payload)
+      if(msg.topic == MQTT_topic_in + "/circle_switch"):
+        global circle_switch
+        circle_switch = str(msg.payload)
+
+      
+    mqtt_client = mqtt.Client()
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    mqtt_client.connect(MQTT_ip, MQTT_port, 60)
+    mqtt_client.loop_start()
+
+    while True:
+      now = subprocess.Popen(["date","+%s%N"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+
+      power_usage = subprocess.Popen(["plugwise_util","-m",circle_plus_mac,"-p"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+      power_usage = power_usage.replace("power usage: ","")
+      power_usage = power_usage.replace("W","")
+      relay_state = subprocess.Popen(["plugwise_util","-m",circle_plus_mac,"-q","relay_state"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+      mqtt_client.publish(MQTT_topic_out, "mqtt_consumer" + "," + "host=cn-ig-plugwise,host_type=container,measurement_type=Power\ Usage,sensor=circle_plus,running_on=pi-ig" + " " + "Power\ Usage=" + power_usage + ",Relay\ State=" + relay_state + " " + now)
+      os.system("plugwise_util -m " + circle_plus_mac + " -s " + circle_plus_switch)
+
+
+      power_usage = subprocess.Popen(["plugwise_util","-m",circle_mac,"-p"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+      power_usage = power_usage.replace("power usage: ","")
+      power_usage = power_usage.replace("W","")
+      relay_state = subprocess.Popen(["plugwise_util","-m",circle_mac,"-q","relay_state"],stdout=subprocess.PIPE).communicate()[0].rstrip()
+      mqtt_client.publish(MQTT_topic_out, "mqtt_consumer" + "," + "host=cn-ig-plugwise,host_type=container,measurement_type=Power\ Usage,sensor=circle,running_on=pi-ig" + " " + "Power\ Usage=" + power_usage + ",Relay\ State=" + relay_state + " " + now)
+      os.system("plugwise_util -m " + circle_mac + " -s " + circle_switch)
+
+
+      time.sleep(1)
+
+  if __name__ == '__main__':
+
+    try:
+      main()
+    except KeyboardInterrupt:
+      pass
+
+#+END_SRC
+
+*** TODO TICK Stack
+    The TICK stack is composed of four different software projects:
+    - Telegraf : a middleware feeding data into the database, which is
+      able to connect to various information sources/services, MQTT is
+      one of them
+    - InfluxDB: a timeseries database, which is able to store
+      timeseries data in an efficient way
+    - Chronograf: a dashboard software, that can be used to display
+      data from InfluxDB
+    - Kapacitor: Kapacitor is a service, which complements Chronograf
+      and can be set up to send out alerts, whenever certain events
+      occur.
+
+    Create a new Ubuntu container and set it up correctly, by
+    installing some packages. Finally we add the repository needed to
+    install the tick stack by creating a new list file in
+    =/etc/apt/sources-list.d=:
+    #+BEGIN_SRC text
+      lxc init images:ubuntu/18.04 pi-tw:cn-tw-tick
+      lxc file push netcfg-tick.yaml pi-tw:cn-tw-tick/etc/netplan/10-lxc.yaml
+      lxc start pi-tw:cn-tw-tick
+      lxc exec pi-tw:cn-tw-tick -- apt update
+      lxc exec pi-tw:cn-tw-tick -- apt install -y curl gnupg
+      lxc file push tick.list pi-tw:cn-tw-tick/etc/apt/sources-list.d/tick.list
+    #+END_SRC
+
+    The =netcfg-tick.yaml= looks like this:
+    #+BEGIN_SRC text
+      network:
+	version: 2
+	ethernets:
+	  eth0:
+	    dhcp4: no
+	    addresses: [10.0.0.16/24]
+	    gateway4: 10.0.0.1
+	    nameservers:
+	      addresses: [10.0.0.1]
+    #+END_SRC
+    
+    The =tick.list= file looks as follows:
+    #+BEGIN_SRC text
+      deb https://repos.influxdata.com/ubuntu bionic stable
+    #+END_SRC
+
+    Then we can add the repositories gpg key by running the following
+    inside the container:
+    #+BEGIN_SRC text
+      root@cn-tw-tick:~# curl -sL https://repos.influxdata.com/influxdb.key | apt-key add -
+      OK
+    #+END_SRC
+    
+    Now the TICK stack can be installed. After the installation we
+    replace the default telegraf configuration with a minimal one and
+    additionally set up telegraf to listen to our MQTT Server on the
+    topics =sciot/json= and =sciot/influx= instead:
+    #+BEGIN_SRC text
+      lxc exec pi-tw:cn-tw-tick -- apt install -y telegraf influxdb chronograf kapacitor
+      lxc exec pi-tw:cn-tw-tick -- rm /etc/telegraf/telegraf.conf
+      lxc file push telegraf.conf pi-tw:cn-tw-tick/etc/telegraf/telegraf.conf
+      lxc file push mqtt_json.conf pi-tw:cn-tw-tick/etc/telegraf/telegraf.d/mqtt_json.conf
+      lxc file push mqtt_influx.conf pi-tw:cn-tw-tick/etc/telegraf/telegraf.d/mqtt_influx.conf
+    #+END_SRC
+
+    The minimal =telegraf.conf= looks like this:
+    #+BEGIN_SRC text
+      [global_tags]
+
+      [agent]
+        interval = "10s"
+        round_interval = true
+        metric_batch_size = 1000
+        metric_buffer_limit = 10000
+        collection_jitter = "0s"
+
+      flush_interval = "10s"
+        flush_jitter = "0s"
+
+
+        precision = ""
+
+        debug = false
+        quiet = false
+        logfile = ""
+
+        hostname = ""
+        omit_hostname = false
+
+      [[outputs.influxdb]]
+    #+END_SRC
+
+    The =mqtt_influx.conf= file looks as follows:
+    #+BEGIN_SRC text
+      # Read metrics from MQTT topic(s)       
+      [[inputs.mqtt_consumer]]                
+	servers = ["tcp://10.0.0.13:1883"]
+
+	qos = 0                               
+	connection_timeout = "30s"            
+
+	topics = [                            
+	  "sciot/influx/#",                            
+	]                                     
+
+
+	data_format = "influx"
+	tag_keys = [
+	  "host",
+	  "running_on",
+	  "host_type",
+	  "sensor",
+	  "sensor_type",
+	  "measurement_type"
+	]
+    #+END_SRC
+    
+    The =mqtt_json.conf= file looks as follows:
+    #+BEGIN_SRC text
+      # Read metrics from MQTT topic(s)       
+      [[inputs.mqtt_consumer]]                
+	servers = ["tcp://10.0.0.13:1883"]
+
+	qos = 0                               
+	connection_timeout = "30s"            
+
+	topics = [                            
+	  "sciot/json/#",                            
+	]                                     
+
+	data_format = "json"
+
+	tag_keys = [
+	  "host",
+	  "running_on",
+	  "host_type",
+	  "sensor",
+	  "sensor_type",
+	  "measurement_type"
+	]
+    #+END_SRC
+
+    Now telegraf will receive any message sent to either of the topics
+    =sciot/influx= or =sciot/json= and put the data into InfluxDB
+    according to the tags we defined, such as =Measurement Type= or
+    =Sensor Type=.
+
+    The reason why We configure telegraf in such a way that the
+    dataformats =json= and =influx= are handled separately is that the
+    telegraf mqtt consumer does only accept a single data format, thus
+    we set up 2 consumers.
+
+    Now we can make sure telegraf, influxdb, chronograf and kapacitor
+    are running:
+
+    #+BEGIN_SRC text
+      lxc exec pi-tw:cn-tw-tick -- systemctl restart telegraf
+      lxc exec pi-tw:cn-tw-tick -- systemctl restart influxdb
+      lxc exec pi-tw:cn-tw-tick -- systemctl restart chronograf
+      lxc exec pi-tw:cn-tw-tick -- systemctl restart kapacitor
+    #+END_SRC
+
+    If you run into any problems, =journalctl -xe= or =netstat -tulpen=
+    are your friend (netstat requires =net-tools= to be installed.
+
+    Then you can connect to =10.0.0.16:8888= to access the Chronograf
+    webinterface and you will be led through a quick setup:
+
+    [[./img/chronograf-01.png]]
+
+    [[./img/chronograf-02.png]]
+
+    [[./img/chronograf-03.png]]
+
+    Now you can set up a dashboard with all the data.
+*** FF container
+    Create a new container for FF, install the =build-essential=
+    package and copy over the FF solver archive:
+
+    #+BEGIN_SRC text
+      lxc init images:ubuntu/18.04 pi-ms:cn-ms-ff
+      lxc file push netcfg-ff.yaml pi-ms:cn-ms-ff/etc/netplan/10-lxc.yaml
+      lxc start pi-ms:cn-ms-ff
+      lxc exec pi-ms:cn-ms-ff -- apt update
+      lxc exec pi-ms:cn-ms-ff -- apt install -y build-essential wget flex bison python python-pip
+      lxc exec pi-ms:cn-ms-ff -- wget https://fai.cs.uni-saarland.de/hoffmann/ff/FF-v2.3.tgz
+      lxc exec pi-ms:cn-ms-ff -- gunzip FF-v2.3.tgz
+      lxc exec pi-ms:cn-ms-ff -- tar -xvf FF-v2.3.tar 
+    #+END_SRC
+
+    The =netcfg-ff.yaml= file looks like this:
+    #+BEGIN_SRC text
+      network:
+	version: 2
+	ethernets:
+	  eth0:
+	    dhcp4: no
+	    addresses: [10.0.0.18/24]
+	    gateway4: 10.0.0.1
+	    nameservers:
+	      addresses: [10.0.0.1]
+    #+END_SRC
+
+    Now you can connect to the container and compile FF:
+    #+BEGIN_SRC text
+      pi@pi-ms:~ $ lxc exec pi-ms:cn-ms-ff bash
+      root@cn-ms-ff:~# cd FF-v2.3
+      root@cn-ms-ff:~/FF-v2.3# make
+      root@cn-ms-ff:~/FF-v2.3# cp ff /bin
+    #+END_SRC
+
+    Now you can use the ff command to solve pddl problems.
+* Reasoning over Data
+** Idea 
+   We have to create a domain definition for our small room.
+  
+   The room will use measurements from the following sensors for
+   reasoning (other measurements are not considered but could easily
+   be added):
+   - Temperature
+   - Light -> which will determine if it is day or night in our model
+
+   In our domain, there are actuators for:
+   - heating
+   - cooling
+
+   For simplicity we will define high light values as day (we use a
+   flashlight as light source) and low values as night.
+
+   At daytime the system will make decisions - based on the current
+   temperature - on what to do with the actuators, options are:
+   - turn on an actuator
+   - turn off an actuator
+   - keep running an actuator
+   - keep an actuator turned off
+
+   At night, the system will go into energy saving mode, which means in
+   our small model it will see to it that all actuators are turned off.
+
+   [[./img/pddl-considerations.png]]
+
+   [[./img/pddl-domain.png]]
+
+   In order to make sure that PDDL always considers everything
+   important to our system, we also introduce 'Considerations' into
+   our domain, namely we use one consideration each in order to
+   enforce checks on energy, the heating system and the cooling
+   system. Considerations are values that are initially false and only
+   set to true if the consideration about what to do in the current
+   state has been made for the considerations context.
+
+   In our problem instances we describe the current state of our
+   system and simply state that we want all considerations to be met,
+   PDDL then finds a solution to what is to be done with the system,
+   regarding energy saving, heating and cooling.
+
+   The Problem Instances are generated by a python script, which is
+   subscribed to the Measurements via MQTT, the planis then created by
+   ff and parsed again by the python script, which then controls our
+   actuators.
+** Domain Description
+   This is our domain description:
+   #+BEGIN_SRC text
+     (define (domain sciot_room)
+
+       (:predicates (timeofday ?tod)
+		    (consideration ?cn)
+		    (temperature ?t)
+		    (heater  ?h)
+		    (cooling ?c)
+		    (heater_turned_on  ?h)
+		    (cooling_turned_on ?c)
+		    (temperature_too_high ?t)
+		    (temperature_too_low  ?t)
+		    (is_daytime    ?tod)
+		    (is_nighttime  ?tod)
+		    (energy_considered ?cn)
+		    (heater_considered ?cn)
+		    (cooling_considered ?cn)
+       )
+               
+       (:action turn_on_device
+	:parameters (?h ?t ?tod ?cn)
+	:precondition (and (heater ?h) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (temperature_too_low ?t) 
+			   (not (heater_turned_on ?h)) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (heater_turned_on ?h) (heater_considered ?cn))
+       )
+
+       (:action keep_running_device
+	:parameters (?h ?t ?tod ?cn)
+	:precondition (and (heater ?h) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (temperature_too_low ?t) 
+			   (heater_turned_on ?h) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (heater_turned_on ?h) (heater_considered ?cn))
+       )
+
+       (:action turn_off_device
+	:parameters (?h ?t ?tod ?cn)
+	:precondition (and (heater ?h)
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (not (temperature_too_low ?t))
+			   (heater_turned_on ?h) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (not (heater_turned_on ?h)) (heater_considered ?cn))
+       )
+
+       (:action keep_device_turned_off
+	:parameters (?h ?t ?tod ?cn)
+	:precondition (and (heater ?h)
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (not (temperature_too_low ?t))
+			   (not (heater_turned_on ?h)) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (not (heater_turned_on ?h)) (heater_considered ?cn))
+       )
+
+       (:action turn_on_device
+	:parameters (?c ?t ?tod ?cn)
+	:precondition (and (cooling ?c) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (temperature_too_high ?t) 
+			   (not (cooling_turned_on ?c)) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (cooling_turned_on ?c) (cooling_considered ?cn))
+       )
+
+       (:action keep_running_device
+	:parameters (?c ?t ?tod ?cn)
+	:precondition (and (cooling ?c) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (temperature_too_low ?t) 
+			   (cooling_turned_on ?c) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (cooling_turned_on ?c) (cooling_considered ?cn))
+       )
+
+       (:action turn_off_device
+	:parameters (?c ?t ?tod ?cn)
+	:precondition (and (cooling ?c) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (not (temperature_too_high ?t))
+			   (cooling_turned_on ?c) 
+			   (is_daytime ?tod)
+		      )
+	:effect (and (not (cooling_turned_on ?c)) (cooling_considered ?cn))
+       )
+
+       (:action keep_device_turned_off
+	:parameters (?c ?t ?tod ?cn)
+	:precondition (and (cooling ?c) 
+			   (temperature ?t) 
+			   (timeofday ?tod) 
+			   (not (temperature_too_high ?t))
+			   (not (cooling_turned_on ?c))
+			   (is_daytime ?tod)
+		      )
+	:effect (and (not (cooling_turned_on ?c)) (cooling_considered ?cn))
+       )
+
+       (:action energy_saving_inactive
+	:parameters (?cn ?tod)
+	:precondition (and 
+			   (timeofday ?tod) 
+			   (is_daytime ?tod)
+			   (not (energy_considered ?cn))
+		      )
+	:effect (energy_considered ?cn)
+       )
+
+       (:action energy_saving_active
+	:parameters (?cn ?tod ?h ?c)
+	:precondition (and 
+			   (heater ?h)
+			   (cooling ?c)
+			   (timeofday ?tod) 
+			   (is_nighttime ?tod)
+			   (not (energy_considered ?cn))
+			   (not (heater_turned_on ?h))
+			   (not (cooling_turned_on ?c))
+		      )
+	:effect (energy_considered ?cn)
+       )
+
+       (:action save_energy
+	:parameters (?h ?tod)
+	:precondition (and (heater ?h)
+			   (timeofday ?tod) 
+			   (heater_turned_on ?h)
+			   (is_nighttime ?tod)
+		      )
+	:effect (not (heater_turned_on ?h)) 
+       )
+
+       (:action save_energy
+	:parameters (?c ?tod)
+	:precondition (and (cooling ?c)
+			   (timeofday ?tod) 
+			   (cooling_turned_on ?c)
+			   (is_nighttime ?tod)
+		      )
+	:effect (not (cooling_turned_on ?c)) 
+       )
+     )
+
+   #+END_SRC
+** Problem Description
+   #+BEGIN_SRC text
+     (define (problem sciot_room_too_cold)
+       (:domain sciot_room)
+       (:objects 
+	 temp 
+	 heat_blow_tool 
+	 cooling_pad 
+	 now 
+	 cn_energy 
+	 cn_heater 
+	 cn_cooling
+       )
+
+       (:init 
+	 (heater heat_blow_tool)
+	 (cooling cooling_pad)
+	 (timeofday now)
+	 (is_daytime now)                ; alternatively: (is_nighttime now)
+	 (temperature temp)
+	 (temperature_too_low temp)      ; alternatively: (temperature_too_high temp)
+	 (cooling_turned_on cooling_pad) ; or:            (heater_turned_on heat_blow_tool) 
+       )
+
+       (:goal (and (heater_considered cn_heater)
+		   (energy_considered cn_energy)
+		   (cooling_considered cn_cooling)
+	      )
+       )
+     )
+   #+END_SRC
+** Python 
+ To feed the problems with our measurements in real time we have another python script which listens to MQTT and gathers the data to put to reasoning.
+ It looks like this:
+ /TBC ?/
+ #+BEGIN_SRC text
+   #!/usr/bin/python
+
+   import time
+   import paho.mqtt.client as mqtt
+   import re
+
+   # define MQTT stuff
+   MQTT_ip    = "10.0.0.13"
+   MQTT_port  = 1883
+   MQTT_topic = "sciot"
+
+   # define global vars
+   current_power_usage = "null"
+   current_temperature = "null"
+   current_heating_on  = "null"
+   current_cooling_on  = "null"
+   current_brightness  = "null"
+   # define boolean variables for problem
+   day = False
+   temperature_too_high = False
+   temperature_too_low  = False
+   cooling_on = False
+   heating_on = False
+
+   # define regexes for matching the different information we want
+   power_usage = re.compile('(?<=Power\\ Usage=)[0-9]\.[0-9]{2}(?=,Relay)')
+   temperature = re.compile('(?<=Temperature=)[0-9]+(?= [0-9])')
+   heating_on_pattern  = re.compile('(?<=sensor=circle_plus).*((?<=Relay\\\\ State=)[0-9](?= [0-9]))') # use match group 1 to get relay state
+   cooling_on_pattern  = re.compile('(?<=sensor=circle).*(Relay\\\\ State=)([0-9])(?= [0-9])') # use match group 1 to get relay state
+   brightness  = re.compile('(?<="Luminance": )[0-9]+\.[0-9](?=})')
+
+
+   def write_problem(day, temperature_too_high, temperature_too_low, cooling_on, heating_on):
+   # delete file or make otherwise sure not to append 
+     problem_file = open('problem.pddl','w+')
+     problem_file.write('(define (problem sciot_room_too_cold) (:domain sciot_room) (:objects temp heat_blow_tool cooling_pad now cn_energy cn_heater cn_cooling ) (:init  (heater heat_blow_tool)(cooling cooling_pad) (timeofday now)')
+
+     if day:
+       problem_file.write('(is_daytime now)')
+     else:
+       problem_file.write('(is_nighttime now)')
+
+     problem_file.write('(temperature temp)')
+
+     if temperature_too_high:
+       problem_file.write('(temperature_too_high temp)')
+
+     if temperature_too_low:
+       problem_file.write('(temperature_too_low temp)')
+
+     if cooling_on:
+       problem_file.write('(cooling_turned_on cooling_pad)')
+
+     if heating_on:
+       problem_file.write('(heater_turned_on heat_blow_tool)')
+
+     problem_file.write('  ) (:goal (and (heater_considered cn_heater) (energy_considered cn_energy) (cooling_considered cn_cooling))))')
+
+     problem_file.close()
+
+   def main():
+     # setting up MQTT
+     def on_connect(client, userdata, flags, rc):
+       print("Connected with result code " + str(rc))
+
+       client.subscribe(MQTT_topic + "/#")
+
+     def on_message(client, userdata, msg):
+       print(msg.topic + " " + str(msg.payload))
+
+       # get target temperature
+       tf = open('./targets')
+       target_temperature = tf.readline()
+       brightness_limit   = tf.readline()
+       tf.close()
+
+       # refer to global vars for keeping data
+       global current_temperature
+       global current_heating_on
+       global current_cooling_on
+       global current_brightness
+       global day
+       global temperature_too_high
+       global temperature_too_low
+       global cooling_on
+       global heating_on
+
+       #get data from message
+    #   current_power_usage = power_usage.findall(msg.payload)
+       temp = temperature.findall(msg.payload)
+       if (len(temp) > 0):
+         #print "have match"
+         current_temperature = int(temp[0])
+       temp = heating_on_pattern.findall(msg.payload)
+       if (len(temp) > 0):
+         current_heating_on = temp[0]
+       temp = cooling_on_pattern.findall(msg.payload)
+       if (len(temp) > 0):
+         current_cooling_on = temp[0][1]
+       temp = brightness.findall(msg.payload)
+       if (len(temp) > 0):
+         current_brightness = temp[0]
+    
+   #    print "power usage ? " + current_power_usage[1]
+       #print current_temperature
+       print "temperature ? " + `current_temperature`
+       print "heating on ? " + current_heating_on
+       print "cooling on ? " + current_cooling_on
+       print "brightness ? " + current_brightness
+
+
+       # check if all data available
+       if (current_temperature == "null" or current_heating_on == "null" or current_cooling_on == "null" or current_brightness == "null"):
+         return
+
+
+       # temperature
+       if (target_temperature > current_temperature):
+         print "too cold, turn on heating"
+         temperature_too_low = True
+       else:
+         temperature_too_low = False
+
+       if (target_temperature == current_temperature):
+         print "everything ok, turn off heating and cooling"
+
+       if (target_temperature < current_temperature):
+         print "too hot, turn on cooling"
+         temperature_too_high = True
+       else:
+         temperature_too_high = False
+       
+       # brightness
+       if (brightness_limit >= current_brightness):
+         print "it is night"
+         day = False
+       else:
+         print "it is day"
+         day = True
+
+       # heating
+       if (int(current_heating_on) == 1):
+         print "heating is on"
+         heating_on = True
+       elif (int(current_heating_on) == 0):
+         print "heating is off"
+         heating_on = False
+       else:
+         print "heating is broken"
+
+       # cooling
+       if (int(current_cooling_on) == 1):
+         print "cooling is on"
+         cooling_on = True
+       elif (int(current_cooling_on) == 0):
+         print "cooling is off"
+         cooling_on = False
+       else:
+         print "cooling is broken"
+
+       # call write problem file
+       write_problem(day, temperature_too_high, temperature_too_low, cooling_on, heating_on)
+         
+     mqtt_client = mqtt.Client()
+     mqtt_client.on_connect = on_connect
+     mqtt_client.on_message = on_message
+     mqtt_client.connect(MQTT_ip, MQTT_port, 60)
+     mqtt_client.loop_start()
+
+     while True:
+       time.sleep(1)
+
+   if __name__ == '__main__':
+
+     try:
+       main()
+     except KeyboardInterrupt:
+       pass
+
+ #+END_SRC
+
+ /<something about solver takes over here>/
+
+ Now we have a plan that is executed by parsing the solver output and feeding the correct data in MQTT so that the system behaves accordingly.
+
+ /TBC/
+ #+BEGIN_SRC text
+   #!/usr/bin/python
+
+   import time
+   import paho.mqtt.client as mqtt
+   import re
+
+   # define MQTT stuff
+   MQTT_ip    = "10.0.0.13"
+   MQTT_port  = 1883
+   MQTT_topic = "sciot"
+
+   # define regexes for matching the different information we want
+   cooling
+   heating
+
+
+   def main():
+     # setting up MQTT
+     def on_connect(client, userdata, flags, rc):
+       print("Connected with result code " + str(rc))
+
+       client.subscribe(MQTT_topic_in + "/#")
+
+     def on_message(client, userdata, msg):
+       print(msg.topic + " " + str(msg.payload))
+       #handle message here
+
+
+     mqtt_client = mqtt.Client()
+     mqtt_client.on_connect = on_connect
+     mqtt_client.on_message = on_message
+     mqtt_client.connect(MQTT_ip, MQTT_port, 60)
+     mqtt_client.loop_start()
+
+     while True:
+       time.sleep(1)
+
+   if __name__ == '__main__':
+
+     try:
+       main()
+     except KeyboardInterrupt:
+       pass
+
+ #+END_SRC
