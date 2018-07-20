@@ -7,7 +7,7 @@
 
   [[./img/smartbox1.jpg]]
 
-  [[./smartbox2.jpg]]
+  [[./img/smartbox2.jpg]]
 
   [[./img/architecture.png]]
 
